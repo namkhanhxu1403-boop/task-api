@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -36,6 +38,15 @@ type registerRequest struct {
 	Password string `json:"password"`
 }
 
+type customClaims struct {
+	Email string `json:"email"`
+	jwt.RegisteredClaims
+}
+
+type signedTokenJSON struct {
+	Token string `json:"token"`
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -54,19 +65,21 @@ var emailFormatComparison = regexp.MustCompile(`^[A-Za-z0-9._%+-]+@[A-Za-z0-9._%
 func registerHandler(db *gorm.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req registerRequest
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<8)
 
 		var maxSizeErr *http.MaxBytesError
 
 		err := json.NewDecoder(r.Body).Decode(&req)
 
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		} else if errors.As(err, &maxSizeErr) {
-			log.Printf(".Body byte size is too large: %v", err)
-			http.Error(w, "internal server error", http.StatusRequestEntityTooLarge)
-			return
+			if errors.As(err, &maxSizeErr) {
+				log.Printf("request .body is too large: %v", err)
+				http.Error(w, "internal server error", http.StatusRequestEntityTooLarge)
+				return
+			} else {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 
 		if req.Email == "" || len(req.Email) > 254 || len(req.Password) < 8 || len(req.Password) > 72 {
@@ -114,8 +127,90 @@ func registerHandler(db *gorm.DB) http.HandlerFunc {
 	}
 }
 
+func loginHandler(db *gorm.DB, secret string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req registerRequest
+
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<8)
+		var maxSizeErr *http.MaxBytesError
+
+		err := json.NewDecoder(r.Body).Decode(&req)
+
+		if err != nil {
+			if errors.As(err, &maxSizeErr) {
+				log.Printf("request .body is too large: %v", err)
+				http.Error(w, "internal server error", http.StatusRequestEntityTooLarge)
+				return
+			} else {
+				log.Printf("%v", err)
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+		}
+
+		if req.Email == "" || req.Password == "" {
+			http.Error(w, "did not enter enough information (either email or password)", http.StatusBadRequest)
+			return
+		}
+
+		processedEmail := strings.ToLower(strings.TrimSpace(req.Email))
+
+		var user User
+		result := db.Where("email = ?", processedEmail).First(&user)
+
+		if result.Error != nil {
+			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				http.Error(w, "invalid email or password", http.StatusUnauthorized)
+				return
+			} else {
+				log.Printf("unexpected database error: %v", result.Error)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+			http.Error(w, "invalid email or password", http.StatusUnauthorized)
+			return
+		}
+
+		claims := customClaims{
+			Email: processedEmail,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+				IssuedAt:  jwt.NewNumericDate(time.Now()),
+				Issuer:    "task-api",
+				Subject:   strconv.Itoa(int(user.ID)),
+			},
+		}
+
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+		signedToken, err := token.SignedString([]byte(secret))
+
+		if err != nil {
+			log.Printf("error when signing token: %v", err)
+			http.Error(w, "error when signing token", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		w.WriteHeader(http.StatusOK)
+
+		resultSignedToken := signedTokenJSON{Token: signedToken}
+
+		json.NewEncoder(w).Encode(resultSignedToken)
+	}
+}
+
 func main() {
 	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable", os.Getenv("DB_HOST"), os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_NAME"), os.Getenv("DB_PORT"))
+	secret := os.Getenv("JWT_SECRET")
+
+	if secret == "" {
+		log.Fatal("no secret key")
+	}
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		TranslateError: true,
@@ -134,6 +229,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /register", registerHandler(db))
 	mux.HandleFunc("GET /health", healthHandler)
+	mux.HandleFunc("POST /login", loginHandler(db, secret))
 	srv := &http.Server{
 		Addr:              ":8080",
 		Handler:           mux,

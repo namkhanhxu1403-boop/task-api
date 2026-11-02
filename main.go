@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,25 @@ type customClaims struct {
 
 type signedTokenJSON struct {
 	Token string `json:"token"`
+}
+
+func createToken(secret string, user User, ttl time.Duration) (string, error) {
+
+	claims := customClaims{
+		Email: user.Email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "task-api",
+			Subject:   strconv.Itoa(int(user.ID)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	signedToken, err := token.SignedString([]byte(secret))
+
+	return signedToken, err
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -174,19 +194,7 @@ func loginHandler(db *gorm.DB, secret string) http.HandlerFunc {
 			return
 		}
 
-		claims := customClaims{
-			Email: processedEmail,
-			RegisteredClaims: jwt.RegisteredClaims{
-				ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
-				IssuedAt:  jwt.NewNumericDate(time.Now()),
-				Issuer:    "task-api",
-				Subject:   strconv.Itoa(int(user.ID)),
-			},
-		}
-
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
-		signedToken, err := token.SignedString([]byte(secret))
+		signedToken, err := createToken(secret, user, 24*time.Hour)
 
 		if err != nil {
 			log.Printf("error when signing token: %v", err)
@@ -201,6 +209,75 @@ func loginHandler(db *gorm.DB, secret string) http.HandlerFunc {
 		resultSignedToken := signedTokenJSON{Token: signedToken}
 
 		json.NewEncoder(w).Encode(resultSignedToken)
+	}
+}
+
+type contextKey string
+
+const userIDKey contextKey = "userID"
+
+func requireAuth(secret string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			http.Error(w, "Authorization header does not start with Bearer", http.StatusUnauthorized)
+			return
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+		var claims customClaims
+		token, err := jwt.ParseWithClaims(tokenString, &claims, func(t *jwt.Token) (any, error) {
+			return []byte(secret), nil
+		}, jwt.WithValidMethods([]string{"HS256"}))
+
+		if err != nil || !token.Valid {
+			http.Error(w, "error with missng or invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), userIDKey, claims.Subject)
+
+		next(w, r.WithContext(ctx))
+		// fmt.Println(authHeader)
+	}
+}
+
+func meHandler(db *gorm.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := r.Context().Value(userIDKey).(string)
+		if !ok {
+			log.Printf("something went wrong with printing the userIDKey")
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		userID, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			log.Printf("something went wrong with converting id to int64: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		var user User
+		result := db.First(&user, userID)
+
+		if result.Error != nil {
+			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				http.Error(w, "status unauthorized", http.StatusUnauthorized)
+				return
+			} else {
+				log.Printf("something went wrong with finding the userID with the database: %v", result.Error)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		w.WriteHeader(http.StatusOK)
+
+		resultJSON := userSend{ID: user.ID, Email: user.Email}
+
+		json.NewEncoder(w).Encode(resultJSON)
 	}
 }
 
@@ -230,6 +307,7 @@ func main() {
 	mux.HandleFunc("POST /register", registerHandler(db))
 	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("POST /login", loginHandler(db, secret))
+	mux.HandleFunc("GET /me", requireAuth(secret, meHandler(db)))
 	srv := &http.Server{
 		Addr:              ":8080",
 		Handler:           mux,
